@@ -1,0 +1,2166 @@
+# Libraries
+library(yuima)
+library(dplyr)
+library(zoo)
+library(future.apply)
+library(progressr)
+library(knitr)
+library(kableExtra)
+library(np)
+library(matrixStats)
+
+# Define a function to ensure the class exists
+define_SDEclass <- function() {
+  if (!isClass("SDEconfounderResult")) {
+    setClass("SDEconfounderResult", slots = list(data = "data.frame"))
+  }
+}
+
+# Define class in the main session
+define_SDEclass()
+
+# Parallel plan
+plan(multisession, workers = 6)
+
+# Ensure workers also know about the class
+future_lapply(1:6, function(x) { 
+  library(np)          # make sure np namespace is loaded on each worker
+  define_SDEclass()    # your custom function
+  x^2 
+})
+
+# ---------------------------
+# Non bayesian
+# ---------------------------
+
+# ---------------------------
+# Nonparametric SDE confounder with bayesian
+# ---------------------------
+
+SDEconfounderNonparametric <- function(Observed, ATE, time, EFXU, EFUY,custom_time=NULL,
+                                       bayesianXU="No", bayesianUY="No",
+                                       nbayes=100, priors=list(sigmaUY=1, sigmaXU=1),
+                                       alpha=0.05, bw_drift=NULL, bw_diffusion=NULL, bwmethod_drift="cv.aic", bwmethod_diffusion="cv.aic",
+                                       scheme="no",stiff="no",tol=1e-8, iteration_solver=5,frozenJacobi=TRUE, seed=NULL) {
+  
+  if (!is.null(seed)) {
+    set.seed(seed)
+  }
+  
+  if (!is.list(priors) || !all(c("sigmaUY", "sigmaXU") %in% names(priors))) {
+    stop("Error: 'priors' must be a list containing 'sigmaUY' and 'sigmaXU'.")
+  }
+  priors$sigmaUY <- as.numeric(priors$sigmaUY)
+  priors$sigmaXU <- as.numeric(priors$sigmaXU)
+  if (length(as.vector(time))!=length(as.vector(Observed))) {
+    stop("Error: Observed and time lengths differ")
+  }
+  
+  if (length(as.vector(Observed))!=length(as.vector(ATE))) {
+    stop("Error: ATE and Observed lengths differ")
+  }
+  
+  if (length(as.vector(time))!=length(as.vector(ATE))) {
+    stop("Error: ATE and time lengths differ")
+  }
+  
+  df <- data.frame(Observed = Observed, ATE = ATE, time = time)
+  if (!is.null(custom_time)) {
+    df_updated <- df[df$time %in% custom_time, ]
+    df_updated <- df_updated[match(custom_time, df_updated$time), ]
+  } else {
+    df_updated <- df
+  }
+  
+  if (nrow(df_updated) < 2) {
+    stop("Too few observations after resampling. Reduce step_size or increase time resolution.")
+  }
+  
+  
+  
+  
+  time <- as.vector(df_updated$time)
+  E <- as.vector(df_updated$Observed) - as.vector(df_updated$ATE)
+  n <- length(time)
+  dE <- diff(E)
+  dt <- diff(time)
+  E_mid <- E[-n]
+  t_mid <- time[-n]
+  
+  
+  # --- Nonparametric drift and diffusion estimation ---
+  if (scheme!="no"){
+    drift_model <- if (is.null(bw_drift)) np::npreg(dE/dt ~ E_mid+t_mid, regtype="ll", bwmethod=bwmethod_drift) else np::npreg(dE/dt ~ E_mid+t_mid, regtype="ll", bws=bw_drift)
+    diffusion_model <- if (is.null(bw_diffusion)) np::npreg((dE^2/dt) ~ E_mid+t_mid, regtype="ll", bwmethod=bwmethod_diffusion) else np::npreg((dE^2/dt) ~ E_mid+t_mid, regtype="ll", bws=bw_diffusion)
+  }
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  # Initialize simulation matrix
+  E_sim <- matrix(E[1], nrow = nbayes, ncol = n)
+  
+  # Standard Wiener increments
+  dU_1 <- matrix(rnorm(nbayes*(n-1)), nrow = nbayes, ncol = n-1)
+  dW<-t(t(dU_1)*sqrt(dt))
+  
+  
+  
+  if (scheme!="no"){
+    mu_vec<- as.numeric(predict(
+      drift_model,
+      newdata = data.frame(E_mid = E, t_mid = time)))
+    sigma2<-as.numeric(predict(
+      diffusion_model,
+      newdata = data.frame(E_mid = E, t_mid = time)
+    ))
+  }
+  
+  
+  
+  
+  
+  
+  ## Implicit solver
+  
+  
+  Newtonsolverimplicitdriftfrozenjacobi <- function(
+    beginningvalue,
+    explicitpart,
+    dt,
+    n_iter,t_mid,drift_model,a_prime,tol
+  ){
+    
+    y <- beginningvalue
+    
+    for (k in 1:n_iter) {
+      
+      mu_val  <- predict(drift_model, newdata = data.frame(E_mid = y, t_mid = t_mid))
+      
+      F  <- y - beginningvalue - mu_val*dt - explicitpart
+      Fp <- 1 - a_prime*dt
+      
+      y_new <- y - F/Fp
+      
+      diff <- abs(y_new - y)
+      
+      converged <- (diff <= tol) & is.finite(diff)
+      
+      
+      if (all(is.finite(diff)) && max(diff) < tol) {
+        converged <- TRUE
+        y <- y_new
+        break
+      }
+      
+      
+      
+      y <- y_new
+      
+    }
+    
+    ## return both value and failure info
+    list(
+      value = y,
+      converged = converged
+    )
+  }
+  
+  
+  
+  Newtonsolverimplicitdrift <- function(
+    beginningvalue,
+    explicitpart,
+    dt,
+    n_iter,t_mid,drift_model,tol
+  ){
+    
+    y <- beginningvalue
+    
+    converged <- FALSE
+    
+    for (k in 1:n_iter) {
+      
+      mu_val  <- predict(drift_model, newdata = data.frame(E_mid = y, t_mid = t_mid))
+      a_prime<- predict(drift_model, newdata = data.frame(E_mid = y, t_mid = t_mid),gradient=TRUE)
+      
+      F  <- y - beginningvalue - mu_val*dt - explicitpart
+      Fp <- 1 - a_prime*dt
+      
+      y_new <- y - F/Fp
+      
+      diff <- abs(y_new - y)
+      
+      converged <- (diff <= tol) & is.finite(diff)
+      
+      if (all(is.finite(diff)) && max(diff) < tol) {
+        converged <- TRUE
+        y <- y_new
+        break
+      }
+      
+      y <- y_new
+      
+    }
+    
+    ## return both value and failure info
+    list(
+      value = y,
+      converged = converged
+    )
+  }
+  
+  
+  newton_failures <- 0L
+  
+  
+  
+  
+  # --- Initialize path ---
+  
+  if (scheme=="no"){
+    E_sim <- matrix(rep(E, each = nbayes), nrow = nbayes, ncol = n)
+    
+    
+  } else{
+    
+    for (i in 2:n){
+      
+      x <- E[i-1]
+      
+      dW_vec <- dW[, i-1]
+      
+      b_i<-ifelse(sigma2[i]>= 0, sigma2[i], 1e-8)
+      
+      b <- ifelse(sigma2[i-1]>= 0, sigma2[i-1], 1e-8)
+      b<-sqrt(b)
+      
+      b_i<-sqrt(b_i)
+      
+      
+      mu<-mu_vec[i-1]
+      
+      
+      
+      
+      # ---------- Explicit schemes ----------
+      
+      
+      
+      
+      if (stiff == "no"){
+        if (scheme == "Euler-Maruyama") {
+          
+          
+          
+          
+          E_sim[, i] <- x + mu*dt[i-1] + b*dW_vec
+        }
+        else if (scheme == "TamedEuler") {
+          
+          
+          E_sim[, i] <- x + (mu*dt[i-1])/(1 + abs(mu)*dt[i-1]) + b*dW_vec
+          
+        }}
+      # Updated implicit step
+      else if (stiff == "yes") {
+        
+        if (scheme == "Euler-Maruyama") {
+          beginningval <- E_sim[, i-1]
+          if (frozenJacobi == TRUE){
+            
+            
+            a_prime<-as.numeric(predict(
+              drift_model,
+              newdata = data.frame(E_mid = x, t_mid = rep(time[i-1], nbayes)), gradient=TRUE
+            ))
+            
+            newton <- Newtonsolverimplicitdriftfrozenjacobi(
+              beginningvalue = beginningval,
+              explicitpart   = b * dW_vec,
+              dt             = dt[i-1],
+              n_iter         = iteration_solver,
+              t_mid          = time[i-1],
+              drift_model    = drift_model,
+              a_prime=a_prime,
+              tol=tol
+            )
+            
+            E_sim[, i]<-newton$value
+            newton_failures <- newton_failures + sum(!newton$converged)
+          } else {
+            
+            
+            
+            newton <- Newtonsolverimplicitdrift(
+              beginningvalue = beginningval,
+              explicitpart   = b * dW_vec,
+              dt             = dt[i-1],
+              n_iter         = iteration_solver,
+              t_mid          = time[i-1],
+              drift_model    = drift_model,
+              tol=tol
+            )
+            
+            E_sim[, i]<-newton$value
+            newton_failures <- newton_failures + sum(!newton$converged)
+            
+          }
+        }
+        else if (scheme == "TamedEuler") {
+          
+          
+          
+          E_sim[, i] <- E_sim[, i-1] + (mu * dt[i-1]) / (1 + abs(mu) * dt[i-1]) + b * dW_vec
+          
+        } 
+        
+      }
+      
+      
+    }
+    if(stiff=="yes"){
+      newton_failure_rate <- newton_failures / (nbayes*(n-1))
+      message(
+        sprintf(
+          "Newton solver failure rate: %.2f%% (%d / %d)",
+          100 * newton_failure_rate,
+          newton_failures,
+          nbayes*(n-1)
+        )
+      )
+    }
+    
+  }
+  
+  
+  
+  # --- Bayesian scaling (correct: divide first, then aggregate) ---
+  
+  # --- Bayesian multipliers ---
+  EFXU_vec <- if (bayesianXU == "Yes") {
+    EFXU * exp(rnorm(nbayes, 0, priors$sigmaXU))
+  } else {
+    rep(EFXU, nbayes)
+  }
+  
+  EFUY_vec <- if (bayesianUY == "Yes") {
+    rnorm(nbayes, EFUY, priors$sigmaUY)
+  } else {
+    rep(EFUY, nbayes)
+  }
+  
+  scale_vec <- EFUY_vec * EFXU_vec
+  
+  E_sim_final<-t(E_sim)
+  
+  for(i in 1:n){
+    E_sim_final[i,]<-E_sim[,i]/scale_vec
+  }
+  
+  
+  
+  
+  colnames(E_sim_final) <- paste0("Trajectory", seq_len(ncol(E_sim_final)))
+  
+  # --- E-value process summaries (no scaling!) ---
+  E_mean <- rowMeans(E_sim_final, na.rm = TRUE)
+  E_CIll <- rowQuantiles(E_sim_final, probs = alpha/2, na.rm = TRUE)
+  E_CIul <- rowQuantiles(E_sim_final, probs = 1 - alpha/2, na.rm = TRUE)
+  
+  Simulation_final <- data.frame(
+    time = time,
+    
+    # Confounder (scaled)
+    mean_Confounder = E_mean,
+    CIll = E_CIll,
+    CIul = E_CIul
+  )
+  result <-  new("SDEconfounderResult",data=Simulation_final)
+  
+  
+  return(result)
+}
+
+
+
+
+
+# ---------------------------
+# Parametric Yuima 1D confounder
+# ---------------------------
+SDEconfounderYuima1d <- function(fit,time, ATE, EFXU, EFUY, volatility, rateEFXU,
+                                 bayesianXU = "No", bayesianUY = "No",
+                                 nSim = 100, nbayes = 200, initial.value = 0,
+                                 priors = list(sigmaUY = 1, sigmaXU = 1), alpha=0.05) {
+  
+  # Ensure priors is a valid list
+  if (!is.list(priors) || !all(c("sigmaUY", "sigmaXU") %in% names(priors))) {
+    stop("Error: 'priors' must be a list containing 'sigmaUY' and 'sigmaXU'.")
+  }
+  time<-as.vector(time)
+  # Convert priors to numeric
+  priors$sigmaUY <- as.numeric(priors$sigmaUY)
+  priors$sigmaXU <- as.numeric(priors$sigmaXU)
+  
+  # Explicitly check numeric inputs
+  numeric_vars <- list(ATE, EFXU, EFUY, volatility, rateEFXU,
+                       priors$sigmaUY, priors$sigmaXU)
+  
+  if (!all(sapply(numeric_vars, is.numeric))) {
+    stop("Error: ATE, EFXU, EFUY, volatility, rateEFXU, sigmaUY, sigmaXU must be numeric. For more complex association between the confounder and outcome we recommend simulating directly from the package")
+  }
+  
+  # Pre-generate all Bayesian random variables
+  EFXU_vec <- if (bayesianXU == "Yes") EFXU * exp(rnorm(nbayes, 0, priors$sigmaXU)) else rep(EFXU, nbayes)
+  EFUY_vec <- if (bayesianUY == "Yes") rnorm(nbayes, EFUY, priors$sigmaUY) else rep(EFUY, nbayes)
+  
+  # Precompute diffusion/drift updates
+  drift_observed <- sapply(fit@model@drift, function(term) as.character(term))[2, ]
+  diffusion_observed <- sapply(fit@model@diffusion, as.character)
+  
+  # Optionally, pre-build the base model once
+  base_mod <- setModel(
+    drift = drift_observed, diffusion = diffusion_observed,
+    state.variable = fit@model@state.variable,
+    solve.variable = fit@model@solve.variable,
+    time.variable = fit@model@time.variable,
+    xinit = initial.value
+  )
+  samp <- setSampling(Terminal = max(time), n = length(time)-1)
+  
+  # Loop only over nbayes to update parameters, simulate, and store
+  Simulation_list <- vector("list", nbayes)
+  for (i in seq_len(nbayes)) {
+    updated_drift <- paste(drift_observed, "/", EFXU_vec[i] * EFUY_vec[i], sep = "")
+    updated_diffusion <- paste(diffusion_observed, "/", EFXU_vec[i] * EFUY_vec[i], sep = "")
+    mod_i <- setModel(
+      drift = updated_drift, diffusion = updated_diffusion,
+      state.variable = fit@model@state.variable,
+      solve.variable = fit@model@solve.variable,
+      time.variable = fit@model@time.variable,
+      xinit = initial.value
+    )
+    Simulation_i <- simulate(mod_i, sampling = samp, true.parameter = fit@coef)
+    Simulation_list[[i]] <- cbind(Simulation_i@data@original.data, time)
+  }
+  
+  # Combine results into a matrix for fast aggregation
+  Simulation_mat <- do.call(cbind, lapply(Simulation_list, function(df) df[,1]))
+  Simulation_final <- data.frame(
+    time = time,
+    mean_Confounder = rowMeans(Simulation_mat),
+    CIll = apply(Simulation_mat, 1, quantile, probs = alpha/2),
+    CIul = apply(Simulation_mat, 1, quantile, probs = 1-alpha/2)
+  )
+  
+  
+  result <- new("SDEconfounderResult",data=Simulation_final)
+  return(result)
+}
+
+# ---------------------------
+# Simulation wrapper (full helper functions included)
+# ---------------------------
+Simulationpara <- function(EFXUsim, EFUYsim, volatilitysim, rateEFXUsim=0,
+                           mu1, sigma1, mu2=0, sigma2=0, mu3=0, sigma3=0,
+                           mu4=0, sigma4=0, Ito) {
+  
+  SimulatingconfounderIto1<-function(mu,sigma){
+    mod <- setModel(drift = mu, diffusion = sigma, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 100, n = 100)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu,sigma))
+    Simulation<-as.data.frame(cbind(Simulation@data@original.data,seq(1,101)))
+    names(Simulation)<-c("Confounder", "time")
+    Simulation
+  }
+  
+  SimulatingconfounderIto2<-function(mu1,sigma1,mu2,sigma2){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 50, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,50)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==50,]$Confounder)
+    samp <- setSampling(Terminal = 100, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(51,101)))
+    names(Simulation2)<-c("Confounder", "time")
+    rbind(Simulation1,Simulation2)
+  }
+  
+  
+  
+  SimulatingconfounderIto3<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,33)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==33,]$Confounder)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(34,67)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==67,]$Confounder)
+    samp <- setSampling(Terminal = 32, n = 32)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(68,100)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3)
+  }
+  
+  
+  
+  SimulatingconfounderIto4<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3,mu4,sigma4){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,25)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==25,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(26,51)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==51,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(52,77)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu4, diffusion = sigma4, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation3[Simulation3$time==77,]$Confounder)
+    samp <- setSampling(Terminal = 22, n = 22)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu4,sigma4))
+    Simulation4<-as.data.frame(cbind(Simulation@data@original.data,seq(78,100)))
+    names(Simulation4)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3,Simulation4)
+  }
+  
+  
+  
+  if (Ito==1) {
+    Confounder<-SimulatingconfounderIto1(mu1,sigma1)
+    mu_t<-mu1
+    sigma_t<-sigma1
+    minmu_t<-mu1-1
+    minsigma_t<-sigma1-1
+    maxmu_t<-mu1+1
+    maxsigma_t<-sigma1+1
+  } else if (Ito==2) {
+    Confounder<-SimulatingconfounderIto2(mu1,sigma1,mu2,sigma2)
+    mu_t<-mean(c(mu1,mu2))
+    sigma_t<-mean(c(sigma1,sigma2))
+    minmu_t<-min(c(mu1,mu2))
+    minsigma_t<-min(c(sigma1,sigma2))
+    maxmu_t<-max(c(mu1,mu2))
+    maxsigma_t<-max(c(sigma1,sigma2))
+  } else if (Ito==3) {
+    Confounder<-SimulatingconfounderIto3(mu1,sigma1,mu2,sigma2,mu3,sigma3)
+    mu_t<-mean(c(mu1,mu2,mu3))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3))
+    minmu_t<-min(c(mu1,mu2,mu3))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3))
+    maxmu_t<-max(c(mu1,mu2,mu3))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3))
+  } else {
+    Confounder<-SimulatingconfounderIto4(mu1,sigma1,mu2,sigma2,mu3,sigma3,mu4,sigma4)
+    mu_t<-mean(c(mu1,mu2,mu3,mu4))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3,sigma4))
+    minmu_t<-min(c(mu1,mu2,mu3,mu4))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3,sigma4))
+    maxmu_t<-max(c(mu1,mu2,mu3,mu4))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3,sigma4))
+    
+  }
+  
+  # --- Compute potential outcomes and observed ATE ---
+  Confounder$U_t0 <- Confounder$Confounder
+  Confounder$U_t1 <- Confounder$Confounder * EFXUsim
+  Confounder$Y0 <- Confounder$U_t0 + rnorm(nrow(Confounder), 0, 1)
+  Confounder$Y1 <- (EFUYsim + 1/EFXUsim) * Confounder$U_t1 + rnorm(nrow(Confounder), 0, 1)
+  Confounder$ATEobserved <- Confounder$Y1 - Confounder$Y0
+  Confounder$time <- (0:(nrow(Confounder)-1)) / 10
+  fitdrift<-lm(ATEobserved~time, data=Confounder)
+  Confounder$diffusion<-Confounder$ATEobserved-predict(fitdrift,data=Confounder)
+  
+  # --- Fit Yuima parametric model ---
+  Delta <- mean(diff(Confounder$time))
+  ATEobserved <- Confounder$ATEobserved
+  mod <- setModel(drift = "adiff", diffusion = "sigmadiff",
+                  state.var = "ATEobserved", time.var = "time",
+                  solve.var = "ATEobserved", xinit = ATEobserved[1])
+  yuima_model <- setYuima(model = mod, data = setData(zoo(ATEobserved, order.by = Confounder$time), delta = Delta))
+  
+  # Start values based on confounder mean/variance
+  
+  fit <- try(qmle(yuima_model,
+                  start = list(adiff = coef(fitdrift)[2], sigmadiff = sd(Confounder$diffusion)),
+                  lower = list(adiff = coef(fitdrift)[2]-0.01, sigmadiff = sd(Confounder$diffusion)-0.01),
+                  upper = list(adiff = coef(fitdrift)[2]+0.01, sigmadiff = sd(Confounder$diffusion)+0.01)),
+             silent = TRUE)
+  
+  # --- Compute parametric confounder credible intervals ---
+  U_tpara <- SDEconfounderYuima1d(fit, Confounder$time, ATE = 0, EFXU = EFXUsim, EFUY = EFUYsim,
+                                  volatility = 0, rateEFXU = 0,nbayes = 200, initial.value = Confounder$U_t0[1])
+  
+  Paradata <- as.data.frame(U_tpara@data)
+  names(Paradata) <- c("time", "Confounder_para", "CIllpara", "CIulpara")
+  
+  Confounder <- subset(Confounder, select=c("time", "ATEobserved", "U_t0", "Y0", "Y1"))
+  Results_final <- merge(Confounder, Paradata, by="time")
+  names(Results_final) <- c("time", "ATE", "Confounder_true", "Y0", "Y1",
+                            "Confounder_para", "CIllpara", "CIulpara")
+  
+  Results_final$RMSEAparaperc <- ifelse(Results_final$Confounder_true > Results_final$CIllpara &
+                                          Results_final$Confounder_true < Results_final$CIulpara, 1, 0)
+  Results_final$RMSEApara <- (Results_final$Confounder_para - Results_final$Confounder_true)^2
+  
+  Simulation_results <- Results_final %>%
+    subset(select = c("RMSEApara", "RMSEAparaperc")) %>%
+    summarise(RMSEApara = sqrt(mean(RMSEApara, na.rm = TRUE)),
+              RMSEAparaperc = mean(RMSEAparaperc, na.rm = TRUE)) %>%
+    as.vector()
+  
+  
+  c(Ito, EFXUsim, EFUYsim, volatilitysim, Simulation_results)
+}
+
+
+Simulationnonpara <- function(EFXUsim, EFUYsim, volatilitysim, rateEFXUsim=0,
+                              mu1, sigma1, mu2=0, sigma2=0, mu3=0, sigma3=0,
+                              mu4=0, sigma4=0, Ito) {
+  
+  SimulatingconfounderIto1<-function(mu,sigma){
+    mod <- setModel(drift = mu, diffusion = sigma, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 100, n = 100)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu,sigma))
+    Simulation<-as.data.frame(cbind(Simulation@data@original.data,seq(1,101)))
+    names(Simulation)<-c("Confounder", "time")
+    Simulation
+  }
+  
+  SimulatingconfounderIto2<-function(mu1,sigma1,mu2,sigma2){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 50, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,50)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==50,]$Confounder)
+    samp <- setSampling(Terminal = 100, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(51,101)))
+    names(Simulation2)<-c("Confounder", "time")
+    rbind(Simulation1,Simulation2)
+  }
+  
+  
+  
+  SimulatingconfounderIto3<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,33)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==33,]$Confounder)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(34,67)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==67,]$Confounder)
+    samp <- setSampling(Terminal = 32, n = 32)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(68,100)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3)
+  }
+  
+  
+  
+  SimulatingconfounderIto4<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3,mu4,sigma4){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,25)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==25,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(26,51)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==51,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(52,77)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu4, diffusion = sigma4, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation3[Simulation3$time==77,]$Confounder)
+    samp <- setSampling(Terminal = 22, n = 22)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu4,sigma4))
+    Simulation4<-as.data.frame(cbind(Simulation@data@original.data,seq(78,100)))
+    names(Simulation4)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3,Simulation4)
+  }
+  
+  
+  
+  if (Ito==1) {
+    Confounder<-SimulatingconfounderIto1(mu1,sigma1)
+    mu_t<-mu1
+    sigma_t<-sigma1
+    minmu_t<-mu1-1
+    minsigma_t<-sigma1-1
+    maxmu_t<-mu1+1
+    maxsigma_t<-sigma1+1
+  } else if (Ito==2) {
+    Confounder<-SimulatingconfounderIto2(mu1,sigma1,mu2,sigma2)
+    mu_t<-mean(c(mu1,mu2))
+    sigma_t<-mean(c(sigma1,sigma2))
+    minmu_t<-min(c(mu1,mu2))
+    minsigma_t<-min(c(sigma1,sigma2))
+    maxmu_t<-max(c(mu1,mu2))
+    maxsigma_t<-max(c(sigma1,sigma2))
+  } else if (Ito==3) {
+    Confounder<-SimulatingconfounderIto3(mu1,sigma1,mu2,sigma2,mu3,sigma3)
+    mu_t<-mean(c(mu1,mu2,mu3))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3))
+    minmu_t<-min(c(mu1,mu2,mu3))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3))
+    maxmu_t<-max(c(mu1,mu2,mu3))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3))
+  } else {
+    Confounder<-SimulatingconfounderIto4(mu1,sigma1,mu2,sigma2,mu3,sigma3,mu4,sigma4)
+    mu_t<-mean(c(mu1,mu2,mu3,mu4))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3,sigma4))
+    minmu_t<-min(c(mu1,mu2,mu3,mu4))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3,sigma4))
+    maxmu_t<-max(c(mu1,mu2,mu3,mu4))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3,sigma4))
+    
+  }
+  
+  Simulation <- Confounder
+  Simulation$U_t0 <- Simulation$Confounder
+  Simulation$U_t1 <- Simulation$Confounder*EFXUsim
+  Simulation$Y0 <- Simulation$U_t0 + rnorm(nrow(Simulation), 0, 1)
+  Simulation$Y1 <- (EFUYsim+1/EFXUsim)*Simulation$U_t1 + rnorm(nrow(Simulation), 0, 1)
+  Simulation$ATEobserved <- Simulation$Y1-Simulation$Y0
+  Simulation$time <- 1:nrow(Simulation)
+  
+  
+  Simulation$ATE<-0
+  
+  U_tnonpara <- SDEconfounderNonparametric(Observed = Simulation$ATEobserved, ATE = Simulation$ATE,
+                                           time = Simulation$time, EFXU = EFXUsim, EFUY = EFUYsim, scheme="Euler-Maruyama")
+  
+  Nonparadata <- as.data.frame(U_tnonpara@data)
+  names(Nonparadata) <- c("time", "Confounder_nonpara", "CIllnonpara", "CIulnonpara")
+  Nonparadata$Confounder_true<-Simulation$U_t0
+  Results_final<-Nonparadata
+  
+  
+  Results_final$RMSEAnonparaperc <- ifelse(Results_final$Confounder_true > Results_final$CIllnonpara & Results_final$Confounder_true < Results_final$CIulnonpara, 1, 0)
+  Results_final$RMSEAnonpara <- (Results_final$Confounder_nonpara - Results_final$Confounder_true)^2
+  
+  
+  Simulation_results <- Results_final %>%
+    subset(select = c("RMSEAnonpara", "RMSEAnonparaperc")) %>%
+    summarise(RMSEAnonpara = sqrt(mean(RMSEAnonpara, na.rm = TRUE)),
+              RMSEAnonparaperc = mean(RMSEAnonparaperc, na.rm = TRUE)) %>%
+    as.vector()
+  
+  c(Ito, EFXUsim, EFUYsim, volatilitysim, Simulation_results)
+}
+
+# ---------------------------
+# Run simulation experiment
+# ---------------------------
+n_reps <- 2
+
+n_reps_true<-1000
+V <- future_replicate(n_reps, expr = {
+  param_grid <- expand.grid(
+    Ito = 1:4,
+    EFUYsim = 1:3,
+    EFXUsim = 2:4,
+    volatilitysim = c(0.1, 1, 2)
+  )
+  
+  results <- unlist(apply(param_grid, 1, function(row) {
+    Simulationpara(
+      EFXUsim = as.numeric(row["EFXUsim"]),
+      EFUYsim = as.numeric(row["EFUYsim"]),
+      volatilitysim = as.numeric(row["volatilitysim"]),
+      mu1 = 0.1, sigma1 = 0.1,
+      mu2 = 0.2, sigma2 = 0.2,
+      mu3 = 0.3, sigma3 = 0.3,
+      mu4 = 0.4, sigma4 = 0.4,
+      Ito = as.integer(row["Ito"])
+    )
+  }))
+  
+  results
+}, future.seed = TRUE)
+
+Vnew <- as.data.frame(t(V))
+names(Vnew) <- make.unique(names(Vnew))
+
+TableIto <- Vnew %>% summarise(across(everything(), mean, na.rm = TRUE))
+TableItopara <- as.data.frame(matrix(TableIto, ncol = 6, byrow = TRUE))
+names(TableItopara) <- c("Ito", "EFXU", "EFUY", "volatility",
+                         "RMSEA parametric", "Coverage parametric confidence interval (%)")
+
+
+V <- future_replicate(n_reps_true, expr = {
+  param_grid <- expand.grid(
+    Ito = 1:4,
+    EFUYsim = 1:3,
+    EFXUsim = 2:4,
+    volatilitysim = c(0.1, 1, 2)
+  )
+  
+  results <- unlist(apply(param_grid, 1, function(row) {
+    Simulationnonpara(
+      EFXUsim = as.numeric(row["EFXUsim"]),
+      EFUYsim = as.numeric(row["EFUYsim"]),
+      volatilitysim = as.numeric(row["volatilitysim"]),
+      mu1 = 0.1, sigma1 = 0.1,
+      mu2 = 0.2, sigma2 = 0.2,
+      mu3 = 0.3, sigma3 = 0.3,
+      mu4 = 0.4, sigma4 = 0.4,
+      Ito = as.integer(row["Ito"])
+    )
+  }))
+  
+  results
+}, future.seed = TRUE)
+
+Vnew <- as.data.frame(t(V))
+names(Vnew) <- make.unique(names(Vnew))
+
+TableIto <- Vnew %>% summarise(across(everything(), mean, na.rm = TRUE))
+TableItononpara <- as.data.frame(matrix(TableIto, ncol = 6, byrow = TRUE))
+names(TableItononpara) <- c("Ito", "EFXU", "EFUY", "volatility",
+                            "RMSEA nonparametric", "Coverage non-parametric confidence interval (%)")
+
+TableIto<-merge(TableItononpara,TableItopara, by=c("Ito", "EFXU", "EFUY", "volatility"))
+
+TableIto1 <- TableIto %>% filter(Ito == 1)
+TableIto2 <- TableIto %>% filter(Ito == 2)
+TableIto3 <- TableIto %>% filter(Ito == 3)
+TableIto4 <- TableIto %>% filter(Ito == 4)
+TableIto1$group <- "Ito 1"
+TableIto2$group <- "Ito 2"
+TableIto3$group <- "Ito 3"
+TableIto4$group <- "Ito 4"
+TableIto1
+combined_TableIto <- bind_rows(TableIto1, TableIto2, TableIto3, TableIto4)
+
+combined_TableIto_display <- combined_TableIto %>%arrange(EFXU) %>% arrange(EFUY) %>% arrange(volatility) %>% arrange(Ito) %>% select(-group, -Ito)
+
+n_rows <- nrow(TableIto1)
+
+sink("simulation_results_non_bayesian.txt", split = TRUE)
+kable(combined_TableIto_display, format = "latex", booktabs = TRUE) %>%
+  group_rows("Ito 1", 1, n_rows) %>%
+  group_rows("Ito 2", n_rows + 1, 2 * n_rows) %>%
+  group_rows("Ito 3", 2 * n_rows + 1, 3 * n_rows) %>%
+  group_rows("Ito 4", 3 * n_rows + 1, 4 * n_rows)
+sink()
+
+# ---------------------------
+# Bayesian EFXU
+# ---------------------------
+
+
+
+
+
+Simulationpara <- function(EFXUsim, EFUYsim, volatilitysim, rateEFXUsim=0,
+                           mu1, sigma1, mu2=0, sigma2=0, mu3=0, sigma3=0,
+                           mu4=0, sigma4=0, Ito) {
+  
+  SimulatingconfounderIto1<-function(mu,sigma){
+    mod <- setModel(drift = mu, diffusion = sigma, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 100, n = 100)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu,sigma))
+    Simulation<-as.data.frame(cbind(Simulation@data@original.data,seq(1,101)))
+    names(Simulation)<-c("Confounder", "time")
+    Simulation
+  }
+  
+  SimulatingconfounderIto2<-function(mu1,sigma1,mu2,sigma2){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 50, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,50)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==50,]$Confounder)
+    samp <- setSampling(Terminal = 100, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(51,101)))
+    names(Simulation2)<-c("Confounder", "time")
+    rbind(Simulation1,Simulation2)
+  }
+  
+  
+  
+  SimulatingconfounderIto3<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,33)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==33,]$Confounder)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(34,67)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==67,]$Confounder)
+    samp <- setSampling(Terminal = 32, n = 32)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(68,100)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3)
+  }
+  
+  
+  
+  SimulatingconfounderIto4<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3,mu4,sigma4){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,25)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==25,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(26,51)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==51,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(52,77)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu4, diffusion = sigma4, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation3[Simulation3$time==77,]$Confounder)
+    samp <- setSampling(Terminal = 22, n = 22)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu4,sigma4))
+    Simulation4<-as.data.frame(cbind(Simulation@data@original.data,seq(78,100)))
+    names(Simulation4)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3,Simulation4)
+  }
+  
+  
+  
+  if (Ito==1) {
+    Confounder<-SimulatingconfounderIto1(mu1,sigma1)
+    mu_t<-mu1
+    sigma_t<-sigma1
+    minmu_t<-mu1-1
+    minsigma_t<-sigma1-1
+    maxmu_t<-mu1+1
+    maxsigma_t<-sigma1+1
+  } else if (Ito==2) {
+    Confounder<-SimulatingconfounderIto2(mu1,sigma1,mu2,sigma2)
+    mu_t<-mean(c(mu1,mu2))
+    sigma_t<-mean(c(sigma1,sigma2))
+    minmu_t<-min(c(mu1,mu2))
+    minsigma_t<-min(c(sigma1,sigma2))
+    maxmu_t<-max(c(mu1,mu2))
+    maxsigma_t<-max(c(sigma1,sigma2))
+  } else if (Ito==3) {
+    Confounder<-SimulatingconfounderIto3(mu1,sigma1,mu2,sigma2,mu3,sigma3)
+    mu_t<-mean(c(mu1,mu2,mu3))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3))
+    minmu_t<-min(c(mu1,mu2,mu3))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3))
+    maxmu_t<-max(c(mu1,mu2,mu3))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3))
+  } else {
+    Confounder<-SimulatingconfounderIto4(mu1,sigma1,mu2,sigma2,mu3,sigma3,mu4,sigma4)
+    mu_t<-mean(c(mu1,mu2,mu3,mu4))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3,sigma4))
+    minmu_t<-min(c(mu1,mu2,mu3,mu4))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3,sigma4))
+    maxmu_t<-max(c(mu1,mu2,mu3,mu4))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3,sigma4))
+    
+  }
+  
+  # --- Compute potential outcomes and observed ATE ---
+  EFXUsimnew<-EFXUsim * exp(rnorm(1, 0, 1))
+  Confounder$U_t0 <- Confounder$Confounder
+  Confounder$U_t1 <- Confounder$Confounder * EFXUsimnew
+  Confounder$Y0 <- Confounder$U_t0 + rnorm(nrow(Confounder), 0, 1)
+  Confounder$Y1 <- (EFUYsim + 1/EFXUsimnew) * Confounder$U_t1 + rnorm(nrow(Confounder), 0, 1)
+  Confounder$ATEobserved <- Confounder$Y1 - Confounder$Y0
+  Confounder$time <- (0:(nrow(Confounder)-1)) / 10
+  fitdrift<-lm(ATEobserved~time, data=Confounder)
+  Confounder$diffusion<-Confounder$ATEobserved-predict(fitdrift,data=Confounder)
+  
+  # --- Fit Yuima parametric model ---
+  Delta <- mean(diff(Confounder$time))
+  ATEobserved <- Confounder$ATEobserved
+  mod <- setModel(drift = "adiff", diffusion = "sigmadiff",
+                  state.var = "ATEobserved", time.var = "time",
+                  solve.var = "ATEobserved", xinit = ATEobserved[1])
+  yuima_model <- setYuima(model = mod, data = setData(zoo(ATEobserved, order.by = Confounder$time), delta = Delta))
+  
+  
+  fit <- try(qmle(yuima_model,
+                  start = list(adiff = coef(fitdrift)[2], sigmadiff = sd(Confounder$diffusion)),
+                  lower = list(adiff = coef(fitdrift)[2]-0.01, sigmadiff = sd(Confounder$diffusion)-0.01),
+                  upper = list(adiff = coef(fitdrift)[2]+0.01, sigmadiff = sd(Confounder$diffusion)+0.01)),
+             silent = TRUE)
+  
+  # --- Compute parametric confounder credible intervals ---
+  U_tpara <- SDEconfounderYuima1d(fit, Confounder$time, ATE = 0, EFXU = EFXUsim, EFUY = EFUYsim,
+                                  volatility = 0, rateEFXU = 0,nbayes = 200,bayesianXU = "Yes", initial.value = Confounder$U_t0[1])
+  
+  Paradata <- as.data.frame(U_tpara@data)
+  names(Paradata) <- c("time", "Confounder_para", "CIllpara", "CIulpara")
+  
+  Confounder <- subset(Confounder, select=c("time", "ATEobserved", "U_t0", "Y0", "Y1"))
+  Results_final <- merge(Confounder, Paradata, by="time")
+  names(Results_final) <- c("time", "ATE", "Confounder_true", "Y0", "Y1",
+                            "Confounder_para", "CIllpara", "CIulpara")
+  
+  Results_final$RMSEAparaperc <- ifelse(Results_final$Confounder_true > Results_final$CIllpara &
+                                          Results_final$Confounder_true < Results_final$CIulpara, 1, 0)
+  Results_final$RMSEApara <- (Results_final$Confounder_para - Results_final$Confounder_true)^2
+  
+  Simulation_results <- Results_final %>%
+    subset(select = c("RMSEApara", "RMSEAparaperc")) %>%
+    summarise(RMSEApara = sqrt(mean(RMSEApara, na.rm = TRUE)),
+              RMSEAparaperc = mean(RMSEAparaperc, na.rm = TRUE)) %>%
+    as.vector()
+  
+  
+  c(Ito, EFXUsim, EFUYsim, volatilitysim, Simulation_results)
+}
+
+
+Simulationnonpara <- function(EFXUsim, EFUYsim, volatilitysim, rateEFXUsim=0,
+                              mu1, sigma1, mu2=0, sigma2=0, mu3=0, sigma3=0,
+                              mu4=0, sigma4=0, Ito) {
+  
+  SimulatingconfounderIto1<-function(mu,sigma){
+    mod <- setModel(drift = mu, diffusion = sigma, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 100, n = 100)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu,sigma))
+    Simulation<-as.data.frame(cbind(Simulation@data@original.data,seq(1,101)))
+    names(Simulation)<-c("Confounder", "time")
+    Simulation
+  }
+  
+  SimulatingconfounderIto2<-function(mu1,sigma1,mu2,sigma2){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 50, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,50)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==50,]$Confounder)
+    samp <- setSampling(Terminal = 100, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(51,101)))
+    names(Simulation2)<-c("Confounder", "time")
+    rbind(Simulation1,Simulation2)
+  }
+  
+  
+  
+  SimulatingconfounderIto3<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,33)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==33,]$Confounder)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(34,67)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==67,]$Confounder)
+    samp <- setSampling(Terminal = 32, n = 32)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(68,100)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3)
+  }
+  
+  
+  
+  SimulatingconfounderIto4<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3,mu4,sigma4){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,25)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==25,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(26,51)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==51,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(52,77)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu4, diffusion = sigma4, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation3[Simulation3$time==77,]$Confounder)
+    samp <- setSampling(Terminal = 22, n = 22)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu4,sigma4))
+    Simulation4<-as.data.frame(cbind(Simulation@data@original.data,seq(78,100)))
+    names(Simulation4)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3,Simulation4)
+  }
+  
+  
+  
+  if (Ito==1) {
+    Confounder<-SimulatingconfounderIto1(mu1,sigma1)
+    mu_t<-mu1
+    sigma_t<-sigma1
+    minmu_t<-mu1-1
+    minsigma_t<-sigma1-1
+    maxmu_t<-mu1+1
+    maxsigma_t<-sigma1+1
+  } else if (Ito==2) {
+    Confounder<-SimulatingconfounderIto2(mu1,sigma1,mu2,sigma2)
+    mu_t<-mean(c(mu1,mu2))
+    sigma_t<-mean(c(sigma1,sigma2))
+    minmu_t<-min(c(mu1,mu2))
+    minsigma_t<-min(c(sigma1,sigma2))
+    maxmu_t<-max(c(mu1,mu2))
+    maxsigma_t<-max(c(sigma1,sigma2))
+  } else if (Ito==3) {
+    Confounder<-SimulatingconfounderIto3(mu1,sigma1,mu2,sigma2,mu3,sigma3)
+    mu_t<-mean(c(mu1,mu2,mu3))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3))
+    minmu_t<-min(c(mu1,mu2,mu3))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3))
+    maxmu_t<-max(c(mu1,mu2,mu3))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3))
+  } else {
+    Confounder<-SimulatingconfounderIto4(mu1,sigma1,mu2,sigma2,mu3,sigma3,mu4,sigma4)
+    mu_t<-mean(c(mu1,mu2,mu3,mu4))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3,sigma4))
+    minmu_t<-min(c(mu1,mu2,mu3,mu4))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3,sigma4))
+    maxmu_t<-max(c(mu1,mu2,mu3,mu4))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3,sigma4))
+    
+  }
+  
+  EFXUsimnew<-EFXUsim * exp(rnorm(1, 0, 1))
+  Simulation <- Confounder
+  Simulation$U_t0 <- Simulation$Confounder
+  Simulation$U_t1 <- Simulation$Confounder*EFXUsimnew
+  Simulation$Y0 <- Simulation$U_t0 + rnorm(nrow(Simulation), 0, 1)
+  Simulation$Y1 <- (EFUYsim+1/EFXUsimnew)*Simulation$U_t1 + rnorm(nrow(Simulation), 0, 1)
+  Simulation$ATEobserved <- Simulation$Y1-Simulation$Y0
+  Simulation$time <- 1:nrow(Simulation)
+  
+  Simulation$ATE<-0
+  
+  
+  U_tnonpara <- SDEconfounderNonparametric(Observed = Simulation$ATEobserved, ATE = Simulation$ATE,
+                                           time = Simulation$time, EFXU = EFXUsim, EFUY = EFUYsim,scheme = "Euler-Maruyama",
+                                           bayesianXU="Yes")
+  
+  Nonparadata <- as.data.frame(U_tnonpara@data)
+  names(Nonparadata) <- c("time", "Confounder_nonpara", "CIllnonpara", "CIulnonpara")
+  Nonparadata$Confounder_true<-Simulation$U_t0
+  Results_final<-Nonparadata
+  
+  
+  Results_final$RMSEAnonparaperc <- ifelse(Results_final$Confounder_true > Results_final$CIllnonpara & Results_final$Confounder_true < Results_final$CIulnonpara, 1, 0)
+  Results_final$RMSEAnonpara <- (Results_final$Confounder_nonpara - Results_final$Confounder_true)^2
+  
+  
+  Simulation_results <- Results_final %>%
+    subset(select = c("RMSEAnonpara", "RMSEAnonparaperc")) %>%
+    summarise(RMSEAnonpara = sqrt(mean(RMSEAnonpara, na.rm = TRUE)),
+              RMSEAnonparaperc = mean(RMSEAnonparaperc, na.rm = TRUE)) %>%
+    as.vector()
+  
+  c(Ito, EFXUsim, EFUYsim, volatilitysim, Simulation_results)
+}
+
+# ---------------------------
+# Run simulation experiment
+# ---------------------------
+
+
+V <- future_replicate(n_reps, expr = {
+  param_grid <- expand.grid(
+    Ito = 1:4,
+    EFUYsim = 1:3,
+    EFXUsim = 2:4,
+    volatilitysim = c(0.1, 1, 2)
+  )
+  
+  results <- unlist(apply(param_grid, 1, function(row) {
+    Simulationpara(
+      EFXUsim = as.numeric(row["EFXUsim"]),
+      EFUYsim = as.numeric(row["EFUYsim"]),
+      volatilitysim = as.numeric(row["volatilitysim"]),
+      mu1 = 0.1, sigma1 = 0.1,
+      mu2 = 0.2, sigma2 = 0.2,
+      mu3 = 0.3, sigma3 = 0.3,
+      mu4 = 0.4, sigma4 = 0.4,
+      Ito = as.integer(row["Ito"])
+    )
+  }))
+  
+  results
+}, future.seed = TRUE)
+
+Vnew <- as.data.frame(t(V))
+names(Vnew) <- make.unique(names(Vnew))
+
+TableIto <- Vnew %>% summarise(across(everything(), mean, na.rm = TRUE))
+TableItopara <- as.data.frame(matrix(TableIto, ncol = 6, byrow = TRUE))
+names(TableItopara) <- c("Ito", "EFXU", "EFUY", "volatility",
+                         "RMSEA parametric", "Coverage parametric confidence interval (%)")
+
+
+V <- future_replicate(n_reps_true, expr = {
+  param_grid <- expand.grid(
+    Ito = 1:4,
+    EFUYsim = 1:3,
+    EFXUsim = 2:4,
+    volatilitysim = c(0.1, 1, 2)
+  )
+  
+  results <- unlist(apply(param_grid, 1, function(row) {
+    Simulationnonpara(
+      EFXUsim = as.numeric(row["EFXUsim"]),
+      EFUYsim = as.numeric(row["EFUYsim"]),
+      volatilitysim = as.numeric(row["volatilitysim"]),
+      mu1 = 0.1, sigma1 = 0.1,
+      mu2 = 0.2, sigma2 = 0.2,
+      mu3 = 0.3, sigma3 = 0.3,
+      mu4 = 0.4, sigma4 = 0.4,
+      Ito = as.integer(row["Ito"])
+    )
+  }))
+  
+  results
+}, future.seed = TRUE)
+
+Vnew <- as.data.frame(t(V))
+names(Vnew) <- make.unique(names(Vnew))
+
+TableIto <- Vnew %>% summarise(across(everything(), mean, na.rm = TRUE))
+TableItononpara <- as.data.frame(matrix(TableIto, ncol = 6, byrow = TRUE))
+names(TableItononpara) <- c("Ito", "EFXU", "EFUY", "volatility",
+                            "RMSEA nonparametric", "Coverage non-parametric confidence interval (%)")
+
+TableIto<-merge(TableItononpara,TableItopara, by=c("Ito", "EFXU", "EFUY", "volatility"))
+
+TableIto1 <- TableIto %>% filter(Ito == 1)
+TableIto2 <- TableIto %>% filter(Ito == 2)
+TableIto3 <- TableIto %>% filter(Ito == 3)
+TableIto4 <- TableIto %>% filter(Ito == 4)
+TableIto1$group <- "Ito 1"
+TableIto2$group <- "Ito 2"
+TableIto3$group <- "Ito 3"
+TableIto4$group <- "Ito 4"
+TableIto1
+combined_TableIto <- bind_rows(TableIto1, TableIto2, TableIto3, TableIto4)
+
+combined_TableIto_display <- combined_TableIto %>%arrange(EFXU) %>% arrange(EFUY) %>% arrange(volatility) %>% arrange(Ito) %>% select(-group, -Ito)
+
+n_rows <- nrow(TableIto1)
+
+sink("simulation_results_EFXU.txt", split = TRUE)
+kable(combined_TableIto_display, format = "latex", booktabs = TRUE) %>%
+  group_rows("Ito 1", 1, n_rows) %>%
+  group_rows("Ito 2", n_rows + 1, 2 * n_rows) %>%
+  group_rows("Ito 3", 2 * n_rows + 1, 3 * n_rows) %>%
+  group_rows("Ito 4", 3 * n_rows + 1, 4 * n_rows)
+sink()
+# ---------------------------
+# Bayesian EFUY
+# ---------------------------
+Simulationpara <- function(EFXUsim, EFUYsim, volatilitysim, rateEFXUsim=0,
+                           mu1, sigma1, mu2=0, sigma2=0, mu3=0, sigma3=0,
+                           mu4=0, sigma4=0, Ito) {
+  
+  SimulatingconfounderIto1<-function(mu,sigma){
+    mod <- setModel(drift = mu, diffusion = sigma, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 100, n = 100)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu,sigma))
+    Simulation<-as.data.frame(cbind(Simulation@data@original.data,seq(1,101)))
+    names(Simulation)<-c("Confounder", "time")
+    Simulation
+  }
+  
+  SimulatingconfounderIto2<-function(mu1,sigma1,mu2,sigma2){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 50, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,50)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==50,]$Confounder)
+    samp <- setSampling(Terminal = 100, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(51,101)))
+    names(Simulation2)<-c("Confounder", "time")
+    rbind(Simulation1,Simulation2)
+  }
+  
+  
+  
+  SimulatingconfounderIto3<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,33)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==33,]$Confounder)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(34,67)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==67,]$Confounder)
+    samp <- setSampling(Terminal = 32, n = 32)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(68,100)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3)
+  }
+  
+  
+  
+  SimulatingconfounderIto4<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3,mu4,sigma4){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,25)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==25,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(26,51)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==51,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(52,77)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu4, diffusion = sigma4, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation3[Simulation3$time==77,]$Confounder)
+    samp <- setSampling(Terminal = 22, n = 22)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu4,sigma4))
+    Simulation4<-as.data.frame(cbind(Simulation@data@original.data,seq(78,100)))
+    names(Simulation4)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3,Simulation4)
+  }
+  
+  
+  
+  if (Ito==1) {
+    Confounder<-SimulatingconfounderIto1(mu1,sigma1)
+    mu_t<-mu1
+    sigma_t<-sigma1
+    minmu_t<-mu1-1
+    minsigma_t<-sigma1-1
+    maxmu_t<-mu1+1
+    maxsigma_t<-sigma1+1
+  } else if (Ito==2) {
+    Confounder<-SimulatingconfounderIto2(mu1,sigma1,mu2,sigma2)
+    mu_t<-mean(c(mu1,mu2))
+    sigma_t<-mean(c(sigma1,sigma2))
+    minmu_t<-min(c(mu1,mu2))
+    minsigma_t<-min(c(sigma1,sigma2))
+    maxmu_t<-max(c(mu1,mu2))
+    maxsigma_t<-max(c(sigma1,sigma2))
+  } else if (Ito==3) {
+    Confounder<-SimulatingconfounderIto3(mu1,sigma1,mu2,sigma2,mu3,sigma3)
+    mu_t<-mean(c(mu1,mu2,mu3))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3))
+    minmu_t<-min(c(mu1,mu2,mu3))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3))
+    maxmu_t<-max(c(mu1,mu2,mu3))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3))
+  } else {
+    Confounder<-SimulatingconfounderIto4(mu1,sigma1,mu2,sigma2,mu3,sigma3,mu4,sigma4)
+    mu_t<-mean(c(mu1,mu2,mu3,mu4))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3,sigma4))
+    minmu_t<-min(c(mu1,mu2,mu3,mu4))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3,sigma4))
+    maxmu_t<-max(c(mu1,mu2,mu3,mu4))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3,sigma4))
+    
+  }
+  
+  # --- Compute potential outcomes and observed ATE ---
+  EFUYsimnew<-rnorm(1, EFUYsim, 1)
+  Confounder$U_t0 <- Confounder$Confounder
+  Confounder$U_t1 <- Confounder$Confounder * EFXUsim
+  Confounder$Y0 <- Confounder$U_t0 + rnorm(nrow(Confounder), 0, 1)
+  Confounder$Y1 <- (EFUYsimnew + 1/EFXUsim) * Confounder$U_t1 + rnorm(nrow(Confounder), 0, 1)
+  Confounder$ATEobserved <- Confounder$Y1 - Confounder$Y0
+  Confounder$time <- (0:(nrow(Confounder)-1)) / 10
+  fitdrift<-lm(ATEobserved~time, data=Confounder)
+  Confounder$diffusion<-Confounder$ATEobserved-predict(fitdrift,data=Confounder)
+  
+  # --- Fit Yuima parametric model ---
+  Delta <- mean(diff(Confounder$time))
+  ATEobserved <- Confounder$ATEobserved
+  mod <- setModel(drift = "adiff", diffusion = "sigmadiff",
+                  state.var = "ATEobserved", time.var = "time",
+                  solve.var = "ATEobserved", xinit = ATEobserved[1])
+  yuima_model <- setYuima(model = mod, data = setData(zoo(ATEobserved, order.by = Confounder$time), delta = Delta))
+  
+  
+  fit <- try(qmle(yuima_model,
+                  start = list(adiff = coef(fitdrift)[2], sigmadiff = sd(Confounder$diffusion)),
+                  lower = list(adiff = coef(fitdrift)[2]-0.01, sigmadiff = sd(Confounder$diffusion)-0.01),
+                  upper = list(adiff = coef(fitdrift)[2]+0.01, sigmadiff = sd(Confounder$diffusion)+0.01)),
+             silent = TRUE)
+  
+  # --- Compute parametric confounder credible intervals ---
+  U_tpara <- SDEconfounderYuima1d(fit, Confounder$time, ATE = 0, EFXU = EFXUsim, EFUY = EFUYsim,
+                                  volatility = 0, rateEFXU = 0,nbayes = 200,bayesianUY = "Yes", initial.value = Confounder$U_t0[1])
+  
+  Paradata <- as.data.frame(U_tpara@data)
+  names(Paradata) <- c("time", "Confounder_para", "CIllpara", "CIulpara")
+  
+  Confounder <- subset(Confounder, select=c("time", "ATEobserved", "U_t0", "Y0", "Y1"))
+  Results_final <- merge(Confounder, Paradata, by="time")
+  names(Results_final) <- c("time", "ATE", "Confounder_true", "Y0", "Y1",
+                            "Confounder_para", "CIllpara", "CIulpara")
+  
+  Results_final$RMSEAparaperc <- ifelse(Results_final$Confounder_true > Results_final$CIllpara &
+                                          Results_final$Confounder_true < Results_final$CIulpara, 1, 0)
+  Results_final$RMSEApara <- (Results_final$Confounder_para - Results_final$Confounder_true)^2
+  
+  Simulation_results <- Results_final %>%
+    subset(select = c("RMSEApara", "RMSEAparaperc")) %>%
+    summarise(RMSEApara = sqrt(mean(RMSEApara, na.rm = TRUE)),
+              RMSEAparaperc = mean(RMSEAparaperc, na.rm = TRUE)) %>%
+    as.vector()
+  
+  
+  c(Ito, EFXUsim, EFUYsim, volatilitysim, Simulation_results)
+}
+
+
+Simulationnonpara <- function(EFXUsim, EFUYsim, volatilitysim, rateEFXUsim=0,
+                              mu1, sigma1, mu2=0, sigma2=0, mu3=0, sigma3=0,
+                              mu4=0, sigma4=0, Ito) {
+  
+  SimulatingconfounderIto1<-function(mu,sigma){
+    mod <- setModel(drift = mu, diffusion = sigma, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 100, n = 100)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu,sigma))
+    Simulation<-as.data.frame(cbind(Simulation@data@original.data,seq(1,101)))
+    names(Simulation)<-c("Confounder", "time")
+    Simulation
+  }
+  
+  SimulatingconfounderIto2<-function(mu1,sigma1,mu2,sigma2){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 50, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,50)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==50,]$Confounder)
+    samp <- setSampling(Terminal = 100, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(51,101)))
+    names(Simulation2)<-c("Confounder", "time")
+    rbind(Simulation1,Simulation2)
+  }
+  
+  
+  
+  SimulatingconfounderIto3<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,33)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==33,]$Confounder)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(34,67)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==67,]$Confounder)
+    samp <- setSampling(Terminal = 32, n = 32)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(68,100)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3)
+  }
+  
+  
+  
+  SimulatingconfounderIto4<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3,mu4,sigma4){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,25)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==25,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(26,51)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==51,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(52,77)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu4, diffusion = sigma4, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation3[Simulation3$time==77,]$Confounder)
+    samp <- setSampling(Terminal = 22, n = 22)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu4,sigma4))
+    Simulation4<-as.data.frame(cbind(Simulation@data@original.data,seq(78,100)))
+    names(Simulation4)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3,Simulation4)
+  }
+  
+  
+  
+  if (Ito==1) {
+    Confounder<-SimulatingconfounderIto1(mu1,sigma1)
+    mu_t<-mu1
+    sigma_t<-sigma1
+    minmu_t<-mu1-1
+    minsigma_t<-sigma1-1
+    maxmu_t<-mu1+1
+    maxsigma_t<-sigma1+1
+  } else if (Ito==2) {
+    Confounder<-SimulatingconfounderIto2(mu1,sigma1,mu2,sigma2)
+    mu_t<-mean(c(mu1,mu2))
+    sigma_t<-mean(c(sigma1,sigma2))
+    minmu_t<-min(c(mu1,mu2))
+    minsigma_t<-min(c(sigma1,sigma2))
+    maxmu_t<-max(c(mu1,mu2))
+    maxsigma_t<-max(c(sigma1,sigma2))
+  } else if (Ito==3) {
+    Confounder<-SimulatingconfounderIto3(mu1,sigma1,mu2,sigma2,mu3,sigma3)
+    mu_t<-mean(c(mu1,mu2,mu3))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3))
+    minmu_t<-min(c(mu1,mu2,mu3))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3))
+    maxmu_t<-max(c(mu1,mu2,mu3))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3))
+  } else {
+    Confounder<-SimulatingconfounderIto4(mu1,sigma1,mu2,sigma2,mu3,sigma3,mu4,sigma4)
+    mu_t<-mean(c(mu1,mu2,mu3,mu4))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3,sigma4))
+    minmu_t<-min(c(mu1,mu2,mu3,mu4))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3,sigma4))
+    maxmu_t<-max(c(mu1,mu2,mu3,mu4))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3,sigma4))
+    
+  }
+  
+  EFUYsimnew<-rnorm(1, EFUYsim, 1)
+  Simulation <- Confounder
+  Simulation$U_t0 <- Simulation$Confounder
+  Simulation$U_t1 <- Simulation$Confounder*EFXUsim
+  Simulation$Y0 <- Simulation$U_t0 + rnorm(nrow(Simulation), 0, 1)
+  Simulation$Y1 <- (EFUYsimnew+1/EFXUsim)*Simulation$U_t1 + rnorm(nrow(Simulation), 0, 1)
+  Simulation$ATEobserved <- Simulation$Y1-Simulation$Y0
+  Simulation$time <- 1:nrow(Simulation)
+  
+  
+  Simulation$ATE<-0
+  
+  U_tnonpara <- SDEconfounderNonparametric(Observed = Simulation$ATEobserved, ATE = Simulation$ATE,
+                                           time = Simulation$time, EFXU = EFXUsim, EFUY = EFUYsim,
+                                           bayesianUY="Yes", scheme = "Euler-Maruyama")
+  
+  Nonparadata <- as.data.frame(U_tnonpara@data)
+  names(Nonparadata) <- c("time", "Confounder_nonpara", "CIllnonpara", "CIulnonpara")
+  Nonparadata$Confounder_true<-Simulation$U_t0
+  Results_final<-Nonparadata
+  
+  
+  Results_final$RMSEAnonparaperc <- ifelse(Results_final$Confounder_true > Results_final$CIllnonpara & Results_final$Confounder_true < Results_final$CIulnonpara, 1, 0)
+  Results_final$RMSEAnonpara <- (Results_final$Confounder_nonpara - Results_final$Confounder_true)^2
+  
+  
+  Simulation_results <- Results_final %>%
+    subset(select = c("RMSEAnonpara", "RMSEAnonparaperc")) %>%
+    summarise(RMSEAnonpara = sqrt(mean(RMSEAnonpara, na.rm = TRUE)),
+              RMSEAnonparaperc = mean(RMSEAnonparaperc, na.rm = TRUE)) %>%
+    as.vector()
+  
+  c(Ito, EFXUsim, EFUYsim, volatilitysim, Simulation_results)
+}
+
+# ---------------------------
+# Run simulation experiment
+# ---------------------------
+
+
+V <- future_replicate(n_reps, expr = {
+  param_grid <- expand.grid(
+    Ito = 1:4,
+    EFUYsim = 1:3,
+    EFXUsim = 2:4,
+    volatilitysim = c(0.1, 1, 2)
+  )
+  
+  results <- unlist(apply(param_grid, 1, function(row) {
+    Simulationpara(
+      EFXUsim = as.numeric(row["EFXUsim"]),
+      EFUYsim = as.numeric(row["EFUYsim"]),
+      volatilitysim = as.numeric(row["volatilitysim"]),
+      mu1 = 0.1, sigma1 = 0.1,
+      mu2 = 0.2, sigma2 = 0.2,
+      mu3 = 0.3, sigma3 = 0.3,
+      mu4 = 0.4, sigma4 = 0.4,
+      Ito = as.integer(row["Ito"])
+    )
+  }))
+  
+  results
+}, future.seed = TRUE)
+
+Vnew <- as.data.frame(t(V))
+names(Vnew) <- make.unique(names(Vnew))
+
+TableIto <- Vnew %>% summarise(across(everything(), mean, na.rm = TRUE))
+TableItopara <- as.data.frame(matrix(TableIto, ncol = 6, byrow = TRUE))
+names(TableItopara) <- c("Ito", "EFXU", "EFUY", "volatility",
+                         "RMSEA parametric", "Coverage parametric confidence interval (%)")
+
+
+V <- future_replicate(n_reps_true, expr = {
+  param_grid <- expand.grid(
+    Ito = 1:4,
+    EFUYsim = 1:3,
+    EFXUsim = 2:4,
+    volatilitysim = c(0.1, 1, 2)
+  )
+  
+  results <- unlist(apply(param_grid, 1, function(row) {
+    Simulationnonpara(
+      EFXUsim = as.numeric(row["EFXUsim"]),
+      EFUYsim = as.numeric(row["EFUYsim"]),
+      volatilitysim = as.numeric(row["volatilitysim"]),
+      mu1 = 0.1, sigma1 = 0.1,
+      mu2 = 0.2, sigma2 = 0.2,
+      mu3 = 0.3, sigma3 = 0.3,
+      mu4 = 0.4, sigma4 = 0.4,
+      Ito = as.integer(row["Ito"])
+    )
+  }))
+  
+  results
+}, future.seed = TRUE)
+
+Vnew <- as.data.frame(t(V))
+names(Vnew) <- make.unique(names(Vnew))
+
+TableIto <- Vnew %>% summarise(across(everything(), mean, na.rm = TRUE))
+TableItononpara <- as.data.frame(matrix(TableIto, ncol = 6, byrow = TRUE))
+names(TableItononpara) <- c("Ito", "EFXU", "EFUY", "volatility",
+                            "RMSEA nonparametric", "Coverage non-parametric confidence interval (%)")
+
+TableIto<-merge(TableItononpara,TableItopara, by=c("Ito", "EFXU", "EFUY", "volatility"))
+
+TableIto1 <- TableIto %>% filter(Ito == 1)
+TableIto2 <- TableIto %>% filter(Ito == 2)
+TableIto3 <- TableIto %>% filter(Ito == 3)
+TableIto4 <- TableIto %>% filter(Ito == 4)
+TableIto1$group <- "Ito 1"
+TableIto2$group <- "Ito 2"
+TableIto3$group <- "Ito 3"
+TableIto4$group <- "Ito 4"
+TableIto1
+combined_TableIto <- bind_rows(TableIto1, TableIto2, TableIto3, TableIto4)
+
+combined_TableIto_display <- combined_TableIto %>%arrange(EFXU) %>% arrange(EFUY) %>% arrange(volatility) %>% arrange(Ito) %>% select(-group, -Ito)
+
+n_rows <- nrow(TableIto1)
+
+sink("simulation_results_EFUY.txt", split = TRUE)
+kable(combined_TableIto_display, format = "latex", booktabs = TRUE) %>%
+  group_rows("Ito 1", 1, n_rows) %>%
+  group_rows("Ito 2", n_rows + 1, 2 * n_rows) %>%
+  group_rows("Ito 3", 2 * n_rows + 1, 3 * n_rows) %>%
+  group_rows("Ito 4", 3 * n_rows + 1, 4 * n_rows)
+sink()
+# ---------------------------
+# Bayesian EFUY and EFUY
+# ---------------------------
+Simulationpara <- function(EFXUsim, EFUYsim, volatilitysim, rateEFXUsim=0,
+                           mu1, sigma1, mu2=0, sigma2=0, mu3=0, sigma3=0,
+                           mu4=0, sigma4=0, Ito) {
+  
+  SimulatingconfounderIto1<-function(mu,sigma){
+    mod <- setModel(drift = mu, diffusion = sigma, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 100, n = 100)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu,sigma))
+    Simulation<-as.data.frame(cbind(Simulation@data@original.data,seq(1,101)))
+    names(Simulation)<-c("Confounder", "time")
+    Simulation
+  }
+  
+  SimulatingconfounderIto2<-function(mu1,sigma1,mu2,sigma2){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 50, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,50)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==50,]$Confounder)
+    samp <- setSampling(Terminal = 100, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(51,101)))
+    names(Simulation2)<-c("Confounder", "time")
+    rbind(Simulation1,Simulation2)
+  }
+  
+  
+  
+  SimulatingconfounderIto3<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,33)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==33,]$Confounder)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(34,67)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==67,]$Confounder)
+    samp <- setSampling(Terminal = 32, n = 32)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(68,100)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3)
+  }
+  
+  
+  
+  SimulatingconfounderIto4<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3,mu4,sigma4){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,25)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==25,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(26,51)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==51,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(52,77)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu4, diffusion = sigma4, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation3[Simulation3$time==77,]$Confounder)
+    samp <- setSampling(Terminal = 22, n = 22)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu4,sigma4))
+    Simulation4<-as.data.frame(cbind(Simulation@data@original.data,seq(78,100)))
+    names(Simulation4)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3,Simulation4)
+  }
+  
+  
+  
+  if (Ito==1) {
+    Confounder<-SimulatingconfounderIto1(mu1,sigma1)
+    mu_t<-mu1
+    sigma_t<-sigma1
+    minmu_t<-mu1-1
+    minsigma_t<-sigma1-1
+    maxmu_t<-mu1+1
+    maxsigma_t<-sigma1+1
+  } else if (Ito==2) {
+    Confounder<-SimulatingconfounderIto2(mu1,sigma1,mu2,sigma2)
+    mu_t<-mean(c(mu1,mu2))
+    sigma_t<-mean(c(sigma1,sigma2))
+    minmu_t<-min(c(mu1,mu2))
+    minsigma_t<-min(c(sigma1,sigma2))
+    maxmu_t<-max(c(mu1,mu2))
+    maxsigma_t<-max(c(sigma1,sigma2))
+  } else if (Ito==3) {
+    Confounder<-SimulatingconfounderIto3(mu1,sigma1,mu2,sigma2,mu3,sigma3)
+    mu_t<-mean(c(mu1,mu2,mu3))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3))
+    minmu_t<-min(c(mu1,mu2,mu3))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3))
+    maxmu_t<-max(c(mu1,mu2,mu3))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3))
+  } else {
+    Confounder<-SimulatingconfounderIto4(mu1,sigma1,mu2,sigma2,mu3,sigma3,mu4,sigma4)
+    mu_t<-mean(c(mu1,mu2,mu3,mu4))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3,sigma4))
+    minmu_t<-min(c(mu1,mu2,mu3,mu4))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3,sigma4))
+    maxmu_t<-max(c(mu1,mu2,mu3,mu4))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3,sigma4))
+    
+  }
+  
+  # --- Compute potential outcomes and observed ATE ---
+  EFUYsimnew<-rnorm(1, EFUYsim, 1)
+  EFXUsimnew<-EFXUsim*exp(rnorm(1, 0, 1))
+  Confounder$U_t0 <- Confounder$Confounder
+  Confounder$U_t1 <- Confounder$Confounder * EFXUsim
+  Confounder$Y0 <- Confounder$U_t0 + rnorm(nrow(Confounder), 0, 1)
+  Confounder$Y1 <- (EFUYsimnew + 1/EFXUsimnew) * Confounder$U_t1 + rnorm(nrow(Confounder), 0, 1)
+  Confounder$ATEobserved <- Confounder$Y1 - Confounder$Y0
+  Confounder$time <- (0:(nrow(Confounder)-1)) / 10
+  fitdrift<-lm(ATEobserved~time, data=Confounder)
+  Confounder$diffusion<-Confounder$ATEobserved-predict(fitdrift,data=Confounder)
+  
+  # --- Fit Yuima parametric model ---
+  Delta <- mean(diff(Confounder$time))
+  ATEobserved <- Confounder$ATEobserved
+  mod <- setModel(drift = "adiff", diffusion = "sigmadiff",
+                  state.var = "ATEobserved", time.var = "time",
+                  solve.var = "ATEobserved", xinit = ATEobserved[1])
+  yuima_model <- setYuima(model = mod, data = setData(zoo(ATEobserved, order.by = Confounder$time), delta = Delta))
+  
+  
+  fit <- try(qmle(yuima_model,
+                  start = list(adiff = coef(fitdrift)[2], sigmadiff = sd(Confounder$diffusion)),
+                  lower = list(adiff = coef(fitdrift)[2]-0.01, sigmadiff = sd(Confounder$diffusion)-0.01),
+                  upper = list(adiff = coef(fitdrift)[2]+0.01, sigmadiff = sd(Confounder$diffusion)+0.01)),
+             silent = TRUE)
+  
+  # --- Compute parametric confounder credible intervals ---
+  U_tpara <- SDEconfounderYuima1d(fit, Confounder$time, ATE = 0, EFXU = EFXUsim, EFUY = EFUYsim,
+                                  volatility = 0, rateEFXU = 0,nbayes = 200,bayesianXU = "Yes",bayesianUY = "Yes", initial.value = Confounder$U_t0[1])
+  
+  Paradata <- as.data.frame(U_tpara@data)
+  names(Paradata) <- c("time", "Confounder_para", "CIllpara", "CIulpara")
+  
+  Confounder <- subset(Confounder, select=c("time", "ATEobserved", "U_t0", "Y0", "Y1"))
+  Results_final <- merge(Confounder, Paradata, by="time")
+  names(Results_final) <- c("time", "ATE", "Confounder_true", "Y0", "Y1",
+                            "Confounder_para", "CIllpara", "CIulpara")
+  
+  Results_final$RMSEAparaperc <- ifelse(Results_final$Confounder_true > Results_final$CIllpara &
+                                          Results_final$Confounder_true < Results_final$CIulpara, 1, 0)
+  Results_final$RMSEApara <- (Results_final$Confounder_para - Results_final$Confounder_true)^2
+  
+  Simulation_results <- Results_final %>%
+    subset(select = c("RMSEApara", "RMSEAparaperc")) %>%
+    summarise(RMSEApara = sqrt(mean(RMSEApara, na.rm = TRUE)),
+              RMSEAparaperc = mean(RMSEAparaperc, na.rm = TRUE)) %>%
+    as.vector()
+  
+  
+  c(Ito, EFXUsim, EFUYsim, volatilitysim, Simulation_results)
+}
+
+
+Simulationnonpara <- function(EFXUsim, EFUYsim, volatilitysim, rateEFXUsim=0,
+                              mu1, sigma1, mu2=0, sigma2=0, mu3=0, sigma3=0,
+                              mu4=0, sigma4=0, Ito) {
+  
+  SimulatingconfounderIto1<-function(mu,sigma){
+    mod <- setModel(drift = mu, diffusion = sigma, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 100, n = 100)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu,sigma))
+    Simulation<-as.data.frame(cbind(Simulation@data@original.data,seq(1,101)))
+    names(Simulation)<-c("Confounder", "time")
+    Simulation
+  }
+  
+  SimulatingconfounderIto2<-function(mu1,sigma1,mu2,sigma2){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 50, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,50)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==50,]$Confounder)
+    samp <- setSampling(Terminal = 100, n = 50)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(51,101)))
+    names(Simulation2)<-c("Confounder", "time")
+    rbind(Simulation1,Simulation2)
+  }
+  
+  
+  
+  SimulatingconfounderIto3<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,33)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==33,]$Confounder)
+    samp <- setSampling(Terminal = 33, n = 33)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(34,67)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==67,]$Confounder)
+    samp <- setSampling(Terminal = 32, n = 32)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(68,100)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3)
+  }
+  
+  
+  
+  SimulatingconfounderIto4<-function(mu1,sigma1,mu2,sigma2, mu3,sigma3,mu4,sigma4){
+    mod <- setModel(drift = mu1, diffusion = sigma1, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = 1)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu1,sigma1))
+    Simulation1<-as.data.frame(cbind(Simulation@data@original.data,seq(0,25)))
+    names(Simulation1)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu2, diffusion = sigma2, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation1[Simulation1$time==25,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu2,sigma2))
+    Simulation2<-as.data.frame(cbind(Simulation@data@original.data,seq(26,51)))
+    names(Simulation2)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu3, diffusion = sigma3, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation2[Simulation2$time==51,]$Confounder)
+    samp <- setSampling(Terminal = 25, n = 25)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu3,sigma3))
+    Simulation3<-as.data.frame(cbind(Simulation@data@original.data,seq(52,77)))
+    names(Simulation3)<-c("Confounder", "time")
+    
+    mod <- setModel(drift = mu4, diffusion = sigma4, state.variable = "Y", solve.variable = "Y", time.variable = "t", xinit = Simulation3[Simulation3$time==77,]$Confounder)
+    samp <- setSampling(Terminal = 22, n = 22)
+    Simulation <- simulate(mod, sampling = samp, true.parameter = c(mu4,sigma4))
+    Simulation4<-as.data.frame(cbind(Simulation@data@original.data,seq(78,100)))
+    names(Simulation4)<-c("Confounder", "time")
+    
+    rbind(Simulation1,Simulation2,Simulation3,Simulation4)
+  }
+  
+  
+  
+  if (Ito==1) {
+    Confounder<-SimulatingconfounderIto1(mu1,sigma1)
+    mu_t<-mu1
+    sigma_t<-sigma1
+    minmu_t<-mu1-1
+    minsigma_t<-sigma1-1
+    maxmu_t<-mu1+1
+    maxsigma_t<-sigma1+1
+  } else if (Ito==2) {
+    Confounder<-SimulatingconfounderIto2(mu1,sigma1,mu2,sigma2)
+    mu_t<-mean(c(mu1,mu2))
+    sigma_t<-mean(c(sigma1,sigma2))
+    minmu_t<-min(c(mu1,mu2))
+    minsigma_t<-min(c(sigma1,sigma2))
+    maxmu_t<-max(c(mu1,mu2))
+    maxsigma_t<-max(c(sigma1,sigma2))
+  } else if (Ito==3) {
+    Confounder<-SimulatingconfounderIto3(mu1,sigma1,mu2,sigma2,mu3,sigma3)
+    mu_t<-mean(c(mu1,mu2,mu3))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3))
+    minmu_t<-min(c(mu1,mu2,mu3))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3))
+    maxmu_t<-max(c(mu1,mu2,mu3))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3))
+  } else {
+    Confounder<-SimulatingconfounderIto4(mu1,sigma1,mu2,sigma2,mu3,sigma3,mu4,sigma4)
+    mu_t<-mean(c(mu1,mu2,mu3,mu4))
+    sigma_t<-mean(c(sigma1,sigma2,sigma3,sigma4))
+    minmu_t<-min(c(mu1,mu2,mu3,mu4))
+    minsigma_t<-min(c(sigma1,sigma2,sigma3,sigma4))
+    maxmu_t<-max(c(mu1,mu2,mu3,mu4))
+    maxsigma_t<-max(c(sigma1,sigma2,sigma3,sigma4))
+    
+  }
+  
+  EFUYsimnew<-rnorm(1, EFUYsim, 1)
+  EFXUsimnew<-EFXUsim*exp(rnorm(1, 0, 1))
+  Simulation <- Confounder
+  Simulation$U_t0 <- Simulation$Confounder
+  Simulation$U_t1 <- Simulation$Confounder*EFXUsimnew
+  Simulation$Y0 <- Simulation$U_t0 + rnorm(nrow(Simulation), 0, 1)
+  Simulation$Y1 <- (EFUYsimnew+1/EFXUsimnew)*Simulation$U_t1 + rnorm(nrow(Simulation), 0, 1)
+  Simulation$ATEobserved <- Simulation$Y1-Simulation$Y0
+  Simulation$time <- 1:nrow(Simulation)
+  
+  
+  Simulation$ATE<-0
+  
+  U_tnonpara <- SDEconfounderNonparametric(Observed = Simulation$ATEobserved, ATE = Simulation$ATE,
+                                           time = Simulation$time, EFXU = EFXUsim, EFUY = EFUYsim,
+                                           bayesianUY = "Yes",bayesianXU = "Yes")
+  
+  Nonparadata <- as.data.frame(U_tnonpara@data)
+  names(Nonparadata) <- c("time", "Confounder_nonpara", "CIllnonpara", "CIulnonpara")
+  Nonparadata$Confounder_true<-Simulation$U_t0
+  Results_final<-Nonparadata
+  
+  
+  Results_final$RMSEAnonparaperc <- ifelse(Results_final$Confounder_true > Results_final$CIllnonpara & Results_final$Confounder_true < Results_final$CIulnonpara, 1, 0)
+  Results_final$RMSEAnonpara <- (Results_final$Confounder_nonpara - Results_final$Confounder_true)^2
+  
+  
+  Simulation_results <- Results_final %>%
+    subset(select = c("RMSEAnonpara", "RMSEAnonparaperc")) %>%
+    summarise(RMSEAnonpara = sqrt(mean(RMSEAnonpara, na.rm = TRUE)),
+              RMSEAnonparaperc = mean(RMSEAnonparaperc, na.rm = TRUE)) %>%
+    as.vector()
+  
+  c(Ito, EFXUsim, EFUYsim, volatilitysim, Simulation_results)
+}
+
+# ---------------------------
+# Run simulation experiment
+# ---------------------------
+
+
+V <- future_replicate(n_reps, expr = {
+  param_grid <- expand.grid(
+    Ito = 1:4,
+    EFUYsim = 1:3,
+    EFXUsim = 2:4,
+    volatilitysim = c(0.1, 1, 2)
+  )
+  
+  results <- unlist(apply(param_grid, 1, function(row) {
+    Simulationpara(
+      EFXUsim = as.numeric(row["EFXUsim"]),
+      EFUYsim = as.numeric(row["EFUYsim"]),
+      volatilitysim = as.numeric(row["volatilitysim"]),
+      mu1 = 0.1, sigma1 = 0.1,
+      mu2 = 0.2, sigma2 = 0.2,
+      mu3 = 0.3, sigma3 = 0.3,
+      mu4 = 0.4, sigma4 = 0.4,
+      Ito = as.integer(row["Ito"])
+    )
+  }))
+  
+  results
+}, future.seed = TRUE)
+
+Vnew <- as.data.frame(t(V))
+names(Vnew) <- make.unique(names(Vnew))
+
+TableIto <- Vnew %>% summarise(across(everything(), mean, na.rm = TRUE))
+TableItopara <- as.data.frame(matrix(TableIto, ncol = 6, byrow = TRUE))
+names(TableItopara) <- c("Ito", "EFXU", "EFUY", "volatility",
+                         "RMSEA parametric", "Coverage parametric confidence interval (%)")
+
+
+V <- future_replicate(n_reps_true, expr = {
+  param_grid <- expand.grid(
+    Ito = 1:4,
+    EFUYsim = 1:3,
+    EFXUsim = 2:4,
+    volatilitysim = c(0.1, 1, 2)
+  )
+  
+  results <- unlist(apply(param_grid, 1, function(row) {
+    Simulationnonpara(
+      EFXUsim = as.numeric(row["EFXUsim"]),
+      EFUYsim = as.numeric(row["EFUYsim"]),
+      volatilitysim = as.numeric(row["volatilitysim"]),
+      mu1 = 0.1, sigma1 = 0.1,
+      mu2 = 0.2, sigma2 = 0.2,
+      mu3 = 0.3, sigma3 = 0.3,
+      mu4 = 0.4, sigma4 = 0.4,
+      Ito = as.integer(row["Ito"])
+    )
+  }))
+  
+  results
+}, future.seed = TRUE)
+
+Vnew <- as.data.frame(t(V))
+names(Vnew) <- make.unique(names(Vnew))
+
+TableIto <- Vnew %>% summarise(across(everything(), mean, na.rm = TRUE))
+TableItononpara <- as.data.frame(matrix(TableIto, ncol = 6, byrow = TRUE))
+names(TableItononpara) <- c("Ito", "EFXU", "EFUY", "volatility",
+                            "RMSEA nonparametric", "Coverage non-parametric confidence interval (%)")
+
+TableIto<-merge(TableItononpara,TableItopara, by=c("Ito", "EFXU", "EFUY", "volatility"))
+
+TableIto1 <- TableIto %>% filter(Ito == 1)
+TableIto2 <- TableIto %>% filter(Ito == 2)
+TableIto3 <- TableIto %>% filter(Ito == 3)
+TableIto4 <- TableIto %>% filter(Ito == 4)
+TableIto1$group <- "Ito 1"
+TableIto2$group <- "Ito 2"
+TableIto3$group <- "Ito 3"
+TableIto4$group <- "Ito 4"
+TableIto1
+combined_TableIto <- bind_rows(TableIto1, TableIto2, TableIto3, TableIto4)
+
+combined_TableIto_display <- combined_TableIto %>%arrange(EFXU) %>% arrange(EFUY) %>% arrange(volatility) %>% arrange(Ito) %>% select(-group, -Ito)
+
+n_rows <- nrow(TableIto1)
+
+sink("simulation_results_both.txt", split = TRUE)
+kable(combined_TableIto_display, format = "latex", booktabs = TRUE) %>%
+  group_rows("Ito 1", 1, n_rows) %>%
+  group_rows("Ito 2", n_rows + 1, 2 * n_rows) %>%
+  group_rows("Ito 3", 2 * n_rows + 1, 3 * n_rows) %>%
+  group_rows("Ito 4", 3 * n_rows + 1, 4 * n_rows)
+sink()
